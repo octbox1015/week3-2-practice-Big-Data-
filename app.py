@@ -1,12 +1,12 @@
 import streamlit as st
 import matplotlib.pyplot as plt
 import numpy as np
-import random, time
+import random, io, time
 from colorsys import hsv_to_rgb
 from matplotlib.path import Path
 
 # ===============================
-# Helper functions
+# 🎨 Palette & Utility
 # ===============================
 def diverse_palette(n_colors=20, seed=None):
     if seed is not None:
@@ -23,8 +23,8 @@ def gaussian_kernel1d(sigma, truncate=3.0):
     if sigma <= 0:
         return np.array([1.0])
     radius = int(truncate * sigma + 0.5)
-    x = np.arange(-radius, radius+1)
-    k = np.exp(-(x**2) / (2*sigma*sigma))
+    x = np.arange(-radius, radius + 1)
+    k = np.exp(-(x ** 2) / (2 * sigma * sigma))
     k /= k.sum()
     return k
 
@@ -32,8 +32,8 @@ def separable_gaussian_blur(img, sigma):
     if sigma <= 0:
         return img
     k = gaussian_kernel1d(sigma)
-    tmp = np.apply_along_axis(lambda row: np.convolve(row, k, mode='same'), 1, img)
-    out = np.apply_along_axis(lambda col: np.convolve(col, k, mode='same'), 0, tmp)
+    tmp = np.apply_along_axis(lambda row: np.convolve(row, k, mode="same"), 1, img)
+    out = np.apply_along_axis(lambda col: np.convolve(col, k, mode="same"), 0, tmp)
     return out
 
 def rasterize_path_mask(path, xmin, xmax, ymin, ymax, W, H):
@@ -45,141 +45,117 @@ def rasterize_path_mask(path, xmin, xmax, ymin, ymax, W, H):
     mask = contains.reshape((H, W))
     return mask, X, Y
 
-def render_blob_shaded(ax, poly_x, poly_y, base_color,
-                       depth=0.5,
-                       light_dir=(-0.6, 0.8),
-                       shadow_offset=(0.02, -0.02),
-                       scene_alpha=0.9,
-                       resolution_scale=600):
-    xmin, xmax = poly_x.min(), poly_x.max()
-    ymin, ymax = poly_y.min(), poly_y.max()
-    pad_x = (xmax - xmin) * 0.45 + 0.01
-    pad_y = (ymax - ymin) * 0.45 + 0.01
-    xmin_p, xmax_p = xmin - pad_x, xmax + pad_x
-    ymin_p, ymax_p = ymin - pad_y, ymax + pad_y
+# ===============================
+# 🌈 Blob Rendering
+# ===============================
+def render_blob(ax, px, py, base_color,
+                depth=0.5, light_dir=(-0.6, 0.8),
+                shadow=True, blur_strength=0.015):
+    from matplotlib.path import Path
 
-    box_w = xmax_p - xmin_p
-    box_h = ymax_p - ymin_p
-    approx_pixels = int(max(80, resolution_scale * max(box_w, box_h)))
-    W = H = approx_pixels
+    xmin, xmax = px.min(), px.max()
+    ymin, ymax = py.min(), py.max()
+    pad = 0.4 * max(xmax - xmin, ymax - ymin)
+    xmin -= pad; xmax += pad
+    ymin -= pad; ymax += pad
 
-    verts = np.column_stack([poly_x, poly_y])
-    codes = [Path.MOVETO] + [Path.LINETO] * (len(verts)-1)
+    verts = np.column_stack([px, py])
+    codes = [Path.MOVETO] + [Path.LINETO] * (len(verts) - 1)
     path = Path(verts, codes)
 
-    mask, X, Y = rasterize_path_mask(path, xmin_p, xmax_p, ymin_p, ymax_p, W, H)
+    H, W = 400, 400
+    mask, X, Y = rasterize_path_mask(path, xmin, xmax, ymin, ymax, W, H)
     mask_f = mask.astype(float)
 
-    cx = poly_x.mean()
-    cy = poly_y.mean()
-    rx = (xmax - xmin) / 2 + 1e-6
-    ry = (ymax - ymin) / 2 + 1e-6
-    nx = (X - cx) / rx
-    ny = (Y - cy) / ry
-    dist = np.sqrt(nx**2 + ny**2)
-    radial = np.clip(1.0 - dist, 0, 1)
+    cx, cy = px.mean(), py.mean()
+    nx, ny = X - cx, Y - cy
+    dist = np.sqrt(nx ** 2 + ny ** 2)
+    radial = np.clip(1.0 - dist / dist.max(), 0, 1)
 
-    ld = np.array(light_dir, dtype=float)
-    ld = ld / (np.linalg.norm(ld) + 1e-9)
-    vx = (X - cx)
-    vy = (Y - cy)
-    vn = np.sqrt(vx**2 + vy**2) + 1e-9
-    vxn = vx / vn
-    vyn = vy / vn
-    dot = vxn * ld[0] + vyn * ld[1]
-    directional = (dot * 0.5 + 0.5)
+    light = np.dot(np.stack([nx, ny], axis=-1), np.array(light_dir))
+    light = (light - light.min()) / (light.max() - light.min())
 
-    spec_center_x = cx - ld[0] * 0.15 * rx
-    spec_center_y = cy - ld[1] * 0.15 * ry
-    sx = (X - spec_center_x) / (rx * 0.6)
-    sy = (Y - spec_center_y) / (ry * 0.6)
-    spec_dist = np.sqrt(sx**2 + sy**2)
-    spec = np.exp(-(spec_dist**2) * 8.0)
+    shade = 0.3 + 0.7 * (0.5 * radial + 0.5 * light)
+    base = np.array(base_color).reshape((1, 1, 3))
+    img_rgb = np.clip(base * shade[..., None], 0, 1)
+    alpha = mask_f * (0.4 + 0.6 * depth)
 
-    ambient = 0.35 + 0.15 * radial
-    shade = ambient + 0.45 * (radial * 0.6 + directional * 0.4)
-    shade = np.clip(shade, 0, 1)
-
-    base = np.array(base_color).reshape((1,1,3))
-    img_rgb = base * shade[..., None]
-    img_rgb = np.clip(img_rgb + (spec[..., None] * 0.6), 0, 1)
-
-    alpha_mask = mask_f * (0.35 + 0.65 * (0.3 + 0.7 * depth)) * scene_alpha
-    alpha_mask = np.clip(alpha_mask, 0, 1)
-
-    rgba = np.zeros((H, W, 4), dtype=float)
+    rgba = np.zeros((H, W, 4))
     rgba[..., :3] = img_rgb
-    rgba[..., 3] = alpha_mask
+    rgba[..., 3] = alpha
 
-    shadow_strength = 0.22 * (1.0 - depth)
-    shadow_sigma = max(2.0, max(W, H) * 0.015)
-    shadow_alpha_map = separable_gaussian_blur(mask_f, shadow_sigma)
-    shadow_alpha_map = shadow_alpha_map * shadow_strength
+    if shadow:
+        shadow_sigma = max(2.0, max(W, H) * blur_strength)
+        shadow_mask = separable_gaussian_blur(mask_f, shadow_sigma)
+        ax.imshow(shadow_mask, extent=[xmin + 0.02, xmax + 0.02, ymin - 0.02, ymax - 0.02],
+                  cmap="gray", alpha=0.25 * (1 - depth), zorder=0)
 
-    extent_shadow = (xmin_p + shadow_offset[0],
-                     xmax_p + shadow_offset[0],
-                     ymin_p + shadow_offset[1],
-                     ymax_p + shadow_offset[1])
-    shadow_rgba = np.zeros((H, W, 4), dtype=float)
-    shadow_rgba[..., 3] = shadow_alpha_map
-    ax.imshow(shadow_rgba, origin='lower', extent=extent_shadow, interpolation='bilinear', zorder=0)
+    ax.imshow(rgba, extent=[xmin, xmax, ymin, ymax], origin="lower", interpolation="bilinear", zorder=1)
 
-    extent_blob = (xmin_p, xmax_p, ymin_p, ymax_p)
-    ax.imshow(rgba, origin='lower', extent=extent_blob, interpolation='bilinear', zorder=1)
 
 # ===============================
-# Streamlit app interface
+# 🖥️ Streamlit Interface
 # ===============================
-st.title("🎨 Generative 3D-like Abstract Poster")
-st.markdown("**Made by He Pengwei | Arts & Advanced Big Data Week4**")
+st.set_page_config(page_title="3D Generative Poster", layout="wide")
 
-# sidebar control panel
-seed = st.sidebar.number_input("Random Seed", min_value=0, max_value=999999, value=42, step=1)
+st.title("🎨 Interactive Generative 3D-like Poster")
+st.markdown("Created by **He Pengwei** · Arts & Advanced Big Data · Week 4")
+
+# Sidebar control
+st.sidebar.header("Control Panel")
+
+seed = st.sidebar.number_input("Random Seed", min_value=0, max_value=999999, value=42)
 n_blobs = st.sidebar.slider("Number of Blobs", 5, 30, 14)
 light_x = st.sidebar.slider("Light X Direction", -1.0, 1.0, -0.6)
 light_y = st.sidebar.slider("Light Y Direction", -1.0, 1.0, 0.8)
-generate_button = st.sidebar.button("🎨 Generate Poster")
+theme = st.sidebar.selectbox("Background Theme", ["cool", "warm", "neutral"])
+shadow_toggle = st.sidebar.checkbox("Enable Shadows", value=True)
+blur_strength = st.sidebar.slider("Shadow Blur Strength", 0.005, 0.05, 0.015)
 
-if generate_button:
+if st.sidebar.button("🎨 Generate Poster"):
+    start = time.time()
     random.seed(seed)
     np.random.seed(seed)
-    fig, ax = plt.subplots(figsize=(7,10))
-    ax.set_xlim(0,1); ax.set_ylim(0,1)
-    ax.set_aspect('equal')
-    ax.axis('off')
-    grad = np.linspace(0.25, 1.0, 600).reshape(-1,1)
-    ax.imshow(grad, extent=[0,1,0,1], origin='lower', cmap='coolwarm', alpha=0.18, zorder=-10)
-
     palette = diverse_palette(n_blobs, seed=seed)
+
+    fig, ax = plt.subplots(figsize=(7, 10))
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+    ax.axis("off")
+
+    # Background color
+    bg_colors = {
+        "cool": ("#a2cffe", "#f7faff"),
+        "warm": ("#ffdfba", "#fffaf0"),
+        "neutral": ("#e8e8e8", "#ffffff")
+    }
+    c1, c2 = bg_colors[theme]
+    grad = np.linspace(0, 1, 600).reshape(-1, 1)
+    ax.imshow(grad, extent=[0, 1, 0, 1], origin="lower", cmap="coolwarm" if theme == "cool" else "Wistia", alpha=0.2)
+
+    # Generate blobs
     blobs = []
     for i in range(n_blobs):
-        r = random.uniform(0.10, 0.26)
+        r = random.uniform(0.1, 0.26)
         wobble = random.uniform(0.08, 0.22)
         cx, cy = random.uniform(0.12, 0.88), random.uniform(0.12, 0.88)
-        angles = np.linspace(0, 2*np.pi, 280)
+        angles = np.linspace(0, 2 * np.pi, 280)
         rr = r * (1 + wobble * (np.random.rand(len(angles)) - 0.5) * 2)
         px = cx + rr * np.cos(angles)
         py = cy + rr * np.sin(angles)
-        depth = i / float(max(1, n_blobs-1))
-        base_color = np.array(palette[i % len(palette)])
-        warm_factor = 0.25 * depth
-        cool_factor = 0.25 * (1 - depth)
-        base_color = base_color + np.array([warm_factor*0.6 - cool_factor*0.1, 0.0, cool_factor*0.7 - warm_factor*0.05])
-        base_color = np.clip(base_color, 0, 1)
-        blobs.append(dict(px=px, py=py, depth=depth, color=tuple(base_color)))
+        depth = i / float(max(1, n_blobs - 1))
+        color = np.array(palette[i % len(palette)])
+        render_blob(ax, px, py, color, depth=depth,
+                    light_dir=(light_x, light_y),
+                    shadow=shadow_toggle,
+                    blur_strength=blur_strength)
 
-    blobs_sorted = sorted(blobs, key=lambda b: b['depth'])
-    for b in blobs_sorted:
-        render_blob_shaded(ax,
-                           np.array(b['px']), np.array(b['py']),
-                           b['color'],
-                           depth=b['depth'],
-                           light_dir=(light_x, light_y),
-                           shadow_offset=(0.02 * (0.6 + 0.8 * (1-b['depth'])),
-                                          -0.02 * (0.6 + 0.8 * (1-b['depth']))),
-                           scene_alpha=1.0,
-                           resolution_scale=480)
-
-    ax.text(0.5, 0.03, f"Seed: {seed}", fontsize=10, ha='center', va='bottom',
-            transform=ax.transAxes, color='gray')
+    ax.text(0.5, 0.03, f"Seed: {seed}", fontsize=10, ha="center", color="gray", transform=ax.transAxes)
     st.pyplot(fig)
+
+    # Export download
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight", dpi=300)
+    st.download_button("📥 Download Poster as PNG", data=buf.getvalue(),
+                       file_name=f"poster_seed_{seed}.png", mime="image/png")
+
+    st.caption(f"⏱️ Rendered in {time.time() - start:.2f} seconds.")
